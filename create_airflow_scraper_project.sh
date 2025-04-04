@@ -13,7 +13,7 @@ source venv/bin/activate
 # 2. Install Airflow and dependencies
 echo "Installing Airflow and Python dependencies..."
 pip install --upgrade pip
-pip install apache-airflow requests psycopg2-binary
+pip install apache-airflow requests psycopg2-binary requests beautifulsoup4
 
 # 3. Freeze requirements
 pip freeze > requirements.txt
@@ -22,48 +22,95 @@ pip freeze > requirements.txt
 mkdir -p dags logs plugins
 
 # 5. Create DAG file
+
 cat <<EOF > dags/etl_web_scraper.py
 from airflow import DAG
-from airflow.operators.python import PythonOperator
-from datetime import datetime
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
+from bs4 import BeautifulSoup
 import requests
 import psycopg2
+import logging
+from datetime import datetime
 
-def extract():
-    url = "https://jsonplaceholder.typicode.com/posts"
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()
-
-def transform(raw_data):
-    return [{"id": item["id"], "title": item["title"]} for item in raw_data]
-
-def load(data):
-    conn = psycopg2.connect(
-        host="postgres",
-        database="scraperdb",
-        user="airflow",
-        password="airflow"
-    )
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS posts (id INTEGER PRIMARY KEY, title TEXT);")
-    for item in data:
-        cur.execute("INSERT INTO posts (id, title) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING;", (item["id"], item["title"]))
-    conn.commit()
-    cur.close()
-    conn.close()
+default_args = {
+    "owner": "airflow",
+}
 
 with DAG(
     dag_id="etl_web_scraper",
-    start_date=datetime(2024, 1, 1),
-    schedule_interval="@daily",
-    catchup=False
+    default_args=default_args,
+    schedule_interval=None,
+    start_date=days_ago(1),
+    catchup=False,
+    tags=["etl", "scraping", "quotes"],
 ) as dag:
-    extract_task = PythonOperator(task_id="extract_data", python_callable=extract)
-    transform_task = PythonOperator(task_id="transform_data", python_callable=lambda **context: transform(context["ti"].xcom_pull(task_ids="extract_data")), provide_context=True)
-    load_task = PythonOperator(task_id="load_data", python_callable=lambda **context: load(context["ti"].xcom_pull(task_ids="transform_data")), provide_context=True)
 
-    extract_task >> transform_task >> load_task
+    @task
+    def extract():
+        url = "https://quotes.toscrape.com"
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        quote_blocks = soup.find_all("div", class_="quote")
+
+        scraped_data = []
+        for idx, block in enumerate(quote_blocks):
+            quote = block.find("span", class_="text").get_text()
+            author = block.find("small", class_="author").get_text()
+            tags = [tag.get_text() for tag in block.find_all("a", class_="tag")]
+
+            scraped_data.append({
+                "id": idx,
+                "quote": quote,
+                "author": author,
+                "tags": tags,
+                "created_at": datetime.utcnow().isoformat()
+            })
+
+        return scraped_data
+
+    @task
+    def transform(data):
+        logging.info("Transforming scraped quotes...")
+        return data
+
+    @task
+    def load(data):
+        logging.info(f"Inserting {len(data)} quotes into the database.")
+        conn = psycopg2.connect(
+            host="postgres",
+            database="scraperdb",
+            user="airflow",
+            password="airflow"
+        )
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS quotes (
+                id INTEGER PRIMARY KEY,
+                quote TEXT,
+                author TEXT,
+                tags TEXT[],
+                created_at TIMESTAMP
+            );
+        """)
+        for item in data:
+            cur.execute("""
+                INSERT INTO quotes (id, quote, author, tags, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING;
+            """, (
+                item["id"],
+                item["quote"],
+                item["author"],
+                item["tags"],
+                item["created_at"]
+            ))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    load(transform(extract()))
 EOF
 
 # 6. Create docker-compose.yaml
