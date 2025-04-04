@@ -55,9 +55,9 @@ docker exec -it airflow-postgres psql -U airflow -d scraperdb
 Run:
 
 ```sql
-\\dt
-\\c scraperdb
-SELECT author, tags, created_at FROM quotes LIMIT 5;
+\dt
+\c scraperdb
+SELECT quote, author, tags, created_at FROM quotes LIMIT 5;
 ```
 
 ✅ Output
